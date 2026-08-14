@@ -1,0 +1,231 @@
+"""Grammatical Error Correction - Streamlit front-end for the fine-tuned T5 model."""
+import difflib
+import html
+import os
+import re
+from pathlib import Path
+
+import streamlit as st
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+# Point at another checkpoint with:  GEC_MODEL_DIR=/path/to/ckpt streamlit run streamlit_app.py
+MODEL_DIR = os.environ.get("GEC_MODEL_DIR", "gec_t5_best")
+TASK_PREFIX = "grammar: "
+MAX_SOURCE_LEN = 96
+MAX_TARGET_LEN = 96
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+st.set_page_config(page_title="Grammatical Error Correction", page_icon="A", layout="wide")
+
+
+def checkpoint_is_present(path):
+    p = Path(path)
+    return p.is_dir() and (p / "config.json").exists()
+
+
+if not checkpoint_is_present(MODEL_DIR):
+    st.title("Grammatical Error Correction")
+    st.error("Fine-tuned checkpoint not found at: " + str(Path(MODEL_DIR).resolve()))
+    st.markdown(
+        """
+The app needs the fine-tuned T5 weights produced in **Phase 2** of the notebook.
+The folder is not committed to the repository because of its size, so pick one of the
+following options.
+
+**Option A - unpack the submitted archive (fastest)**
+
+```bash
+unzip gec_t5_best.zip        # produces ./gec_t5_best/
+streamlit run streamlit_app.py
+```
+
+**Option B - regenerate it from the notebook (~10-20 min on a GPU)**
+
+Open `GEC_T5_Assignment2.ipynb` and run every cell up to and including the Phase 2 training
+cell. It calls `trainer.save_model('gec_t5_best')` and `tokenizer.save_pretrained('gec_t5_best')`,
+which creates the folder next to the notebook.
+
+**Option C - point at a checkpoint you already have**
+
+```bash
+GEC_MODEL_DIR=/path/to/checkpoint streamlit run streamlit_app.py
+```
+
+A valid checkpoint folder contains `config.json`, `model.safetensors` (or `pytorch_model.bin`),
+`spiece.model`, `tokenizer_config.json` and `generation_config.json`.
+"""
+    )
+    st.stop()
+
+
+@st.cache_resource(show_spinner="Loading fine-tuned T5 ...")
+def load_model(model_dir):
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(model_dir).to(DEVICE).eval()
+    return tok, mdl
+
+
+tokenizer, model = load_model(MODEL_DIR)
+
+
+def clean(text):
+    return re.sub(r"\s+", " ", str(text).replace("\u00a0", " ")).strip()
+
+
+def split_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean(text)) if s.strip()]
+
+
+def with_terminal(text):
+    """Every training sentence ended in punctuation; users typing here often omit it."""
+    return text if text[-1:] in ".!?" else text + "."
+
+
+@torch.no_grad()
+def generate(sentences, num_beams):
+    enc = tokenizer([TASK_PREFIX + s for s in sentences], return_tensors="pt",
+                    padding=True, truncation=True, max_length=MAX_SOURCE_LEN).to(DEVICE)
+    out = model.generate(**enc, num_beams=num_beams, max_new_tokens=MAX_TARGET_LEN,
+                         length_penalty=1.0, early_stopping=True)
+    return [t.strip() for t in tokenizer.batch_decode(out, skip_special_tokens=True)]
+
+
+@torch.no_grad()
+def sequence_logprob(source, candidate):
+    enc = tokenizer([TASK_PREFIX + source], return_tensors="pt",
+                    truncation=True, max_length=MAX_SOURCE_LEN).to(DEVICE)
+    lab = tokenizer(text_target=[candidate], return_tensors="pt",
+                    truncation=True, max_length=MAX_TARGET_LEN)["input_ids"].to(DEVICE)
+    return -model(**enc, labels=lab).loss.item()
+
+
+def edit_ratio(source, prediction):
+    a, b = source.split(), prediction.split()
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    changed = sum(max(i2 - i1, j2 - j1)
+                  for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
+    return changed / max(len(a), 1)
+
+
+def guard(source, prediction, max_edit_ratio, keep_margin, confident_margin=0.10):
+    """Phase 3 over-correction mitigation: keep the original unless the rewrite is clearly better."""
+    if not prediction:
+        return source, "empty generation"
+    if prediction == source:
+        return prediction, "no change needed"
+    gain = sequence_logprob(source, prediction) - sequence_logprob(source, source)
+    # A short sentence exceeds a fixed ratio after one legitimate fix, so only revert a
+    # large rewrite when the model is not clearly more confident in it.
+    if edit_ratio(source, prediction) > max_edit_ratio and gain < confident_margin:
+        return source, "reverted: rewrite too aggressive"
+    if gain <= keep_margin:
+        return source, "reverted: source already fluent"
+    return prediction, "correction applied"
+
+
+def diff_html(source, prediction):
+    a, b = source.split(), prediction.split()
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+        old = html.escape(" ".join(a[i1:i2]))
+        new = html.escape(" ".join(b[j1:j2]))
+        if tag == "equal":
+            out.append(old)
+        elif tag == "delete":
+            out.append("<span style='background:#ffd6d6;text-decoration:line-through'>" + old + "</span>")
+        elif tag == "insert":
+            out.append("<span style='background:#d6f5d6'>" + new + "</span>")
+        else:
+            out.append("<span style='background:#ffd6d6;text-decoration:line-through'>" + old + "</span> "
+                       "<span style='background:#d6f5d6'>" + new + "</span>")
+    return "<div style='line-height:1.9;font-size:1.03rem'>" + " ".join(x for x in out if x) + "</div>"
+
+
+st.title("Grammatical Error Correction")
+st.caption("Seq2seq (T5) fine-tuned on the Grammarly CoEdIT GEC subset - "
+           "noisy text in, fluent English out.")
+
+with st.sidebar:
+    st.header("Decoding")
+    num_beams = st.slider("Beam size", 1, 8, 4)
+    st.header("Over-correction guard")
+    use_guard = st.toggle("Enable guard", value=True,
+                          help="Keeps the original wording when the rewrite is not clearly better.")
+    max_edit_ratio = st.slider("Max edit ratio", 0.1, 1.0, 0.40, 0.05,
+                               disabled=not use_guard,
+                               help="Reject rewrites touching more than this share of the words.")
+    keep_margin = st.slider("Keep-original margin", 0.0, 0.5, 0.05, 0.01,
+                            disabled=not use_guard,
+                            help="How much more likely the rewrite must be before it is accepted.")
+    confident_margin = st.slider("Confident-rewrite margin", 0.0, 1.0, 0.10, 0.05,
+                                 disabled=not use_guard,
+                                 help="A rewrite above the edit-ratio limit is still kept when it "
+                                      "beats the source by at least this much log-probability.")
+    st.divider()
+    st.caption("Device: " + DEVICE)
+    st.caption("Checkpoint: " + MODEL_DIR)
+
+EXAMPLES = {
+    "Subject-verb agreement": "He go to school every day and study very hard.",
+    "Plural / article": "The datas are stored in the server and it was corrupt.",
+    "Tense": "I has been working here since 2019 and I have learn a lot.",
+    "Heavily garbled": "I am burger going eat to",
+    "Already correct (over-correction test)":
+        "The results, which were published last week, confirm our hypothesis.",
+}
+
+if "text" not in st.session_state:
+    st.session_state.text = list(EXAMPLES.values())[0]
+
+st.write("**Try an example:**")
+cols = st.columns(len(EXAMPLES))
+for col, (name, sentence) in zip(cols, EXAMPLES.items()):
+    if col.button(name, use_container_width=True):
+        st.session_state.text = sentence
+
+left, right = st.columns(2)
+with left:
+    st.subheader("Input")
+    text = st.text_area("Your text", key="text", height=220, label_visibility="collapsed")
+    run = st.button("Correct text", type="primary", use_container_width=True)
+
+with right:
+    st.subheader("Corrected")
+    placeholder = st.container()
+
+if run:
+    sentences = split_sentences(text)
+    if not sentences:
+        placeholder.warning("Please enter some text.")
+    else:
+        # Generate and score on the punctuated form, then drop any period we added.
+        probes = [with_terminal(s) for s in sentences]
+        raw_preds = generate(probes, num_beams)
+        finals, decisions = [], []
+        for src, probe, pred in zip(sentences, probes, raw_preds):
+            if use_guard:
+                final, why = guard(probe, pred, max_edit_ratio, keep_margin, confident_margin)
+            else:
+                final, why = pred, "guard disabled"
+            if probe != src and final.endswith("."):
+                final = final[:-1]
+            finals.append(final)
+            decisions.append({"sentence": src, "model output": pred,
+                              "final": final, "decision": why,
+                              "edit ratio": round(edit_ratio(probe, pred), 2)})
+
+        corrected = " ".join(finals)
+        placeholder.success(corrected)
+
+        n_changed = sum(1 for s, f in zip(sentences, finals) if s != f)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sentences", len(sentences))
+        c2.metric("Sentences edited", n_changed)
+        c3.metric("Left untouched", len(sentences) - n_changed)
+
+        st.subheader("Edits")
+        st.markdown(diff_html(" ".join(sentences), corrected), unsafe_allow_html=True)
+
+        with st.expander("Per-sentence guard decisions (Phase 3)"):
+            st.dataframe(decisions, use_container_width=True)
