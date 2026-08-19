@@ -1,0 +1,14 @@
+{
+  "model": "t5-small",
+  "hardware": "x86_64 CPU (16 cores)",
+  "device": "cpu",
+  "fp16": false,
+  "train_examples": 18101,
+  "epochs_run": 4.0,
+  "epochs_max": 8,
+  "best_eval_loss": 0.2860608994960785,
+  "wall_clock_minutes": 30.99,
+  "minutes_per_epoch": 7.75,
+  "learning_rate": 0.0003,
+  "batch_size": 16
+}
